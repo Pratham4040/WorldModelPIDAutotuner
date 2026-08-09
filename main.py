@@ -232,6 +232,7 @@ def main():
         # =====================================================================
         # PRE-HEAT PHASE & THERMAL SETTLING
         # =====================================================================
+        preheat_records = []
         preheat_threshold = args.target - 2.5
         if t_init < preheat_threshold:
             print("---------------------------------------------------------------------")
@@ -248,12 +249,21 @@ def main():
                 
                 pwm = 255.0  # Apply maximum heat to reach preheat threshold rapidly (Bang-Bang Control)
                 if isinstance(hardware, ThermalSimulator):
-                    hardware.step(pwm)
+                    _, applied_pwm = hardware.step(pwm)
                 else:
-                    hardware.set_pwm(pwm)
+                    success, applied_pwm = hardware.set_pwm(pwm)
+                    if not success:
+                        applied_pwm = int(pwm)
                     
+                preheat_records.append({
+                    'step': len(preheat_records),
+                    'temperature': temp,
+                    'pwm': applied_pwm,
+                    'target': preheat_threshold
+                })
+                
                 if step % 10 == 0:
-                    print(f"  Preheating | Temp: {temp:.2f}C | Threshold: {preheat_threshold:.1f}C | PWM: {int(pwm)}")
+                    print(f"  Preheating | Temp: {temp:.2f}C | Threshold: {preheat_threshold:.1f}C | PWM: {int(applied_pwm)}")
                 
                 if not isinstance(hardware, ThermalSimulator):
                     time.sleep(1.0)
@@ -272,6 +282,19 @@ def main():
                 if temp is None or safety_active:
                     print("[Warning] Sensor error or safety active during settling!")
                     break
+                
+                applied_pwm = 0
+                if isinstance(hardware, ESP32Client):
+                    hardware.set_pwm(0)
+                else:
+                    hardware.step(0)
+                    
+                preheat_records.append({
+                    'step': len(preheat_records),
+                    'temperature': temp,
+                    'pwm': applied_pwm,
+                    'target': settle_target
+                })
                 
                 # Check if temperature has peaked and cooled down below settle_target
                 if step >= 15 and temp <= settle_target:
@@ -296,6 +319,12 @@ def main():
         # Collect data while exciting the thermal dynamics (toggling setpoint)
         df_train = run_chamber_loop(hardware, init_pid, args.collect_time, args.target, excite_dynamics=True)
         
+        # Merge preheat records if gathered
+        if len(preheat_records) > 0:
+            df_preheat = pd.DataFrame(preheat_records)
+            df_train = pd.concat([df_preheat, df_train], ignore_index=True)
+            df_train['step'] = np.arange(len(df_train))
+        
         # Turn off heater cleanly
         if args.mode == 'sim':
             hardware.reset(df_train['temperature'].iloc[-1])
@@ -312,7 +341,7 @@ def main():
             return
             
         df_train.to_csv(data_path, index=False)
-        print(f"Dataset successfully saved to: {data_path} ({len(df_train)} records)\n")
+        print(f"Dataset successfully saved to: {data_path} ({len(df_train)} total records including preheating/settling)\n")
         
         # Allow system to cool down slightly/pause between phases
         print("Waiting 3 seconds for system transition...")

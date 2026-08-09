@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data directory (log files and collected datasets)
+data/*.csv
+data/*.xlsx
+data/*.json
+
+# Saved model weights
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Generated report figures
+reports/*.png
+reports/*.jpg
+reports/*.pdf
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

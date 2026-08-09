@@ -19,6 +19,72 @@ def ensure_dirs():
     for d in ['data', 'models', 'reports']:
         os.makedirs(d, exist_ok=True)
 
+def update_cycle_reports(df_train, history, autotuner, kp, ki, kd, target_temp, cycle, initial_temp=33.0):
+    """
+    Updates all diagnostic plots in reports/ after every online autotuning cycle.
+    """
+    try:
+        # 1. Update Hardware Performance Trajectory Plot (reports/performance_comparison.png)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        
+        ax1.plot(df_train['step'], df_train['temperature'], label='Chamber Temperature (C)', color='firebrick', linewidth=1.5)
+        ax1.axhline(target_temp, color='navy', linestyle='--', linewidth=1.5, label=f'Target ({target_temp:.1f}C)')
+        ax1.set_ylabel('Temperature (C)', fontsize=11)
+        ax1.set_title(f'Live Hardware Performance Trajectory (Cycle #{cycle})', fontsize=13, fontweight='bold')
+        ax1.legend(loc='upper right')
+        ax1.grid(True, linestyle=':', alpha=0.6)
+        
+        ax2.plot(df_train['step'], df_train['pwm'], label='Heater Duty Cycle (PWM 0-255)', color='darkgreen', linewidth=1.2)
+        ax2.set_xlabel('Time (Seconds)', fontsize=11)
+        ax2.set_ylabel('PWM Duty Cycle', fontsize=11)
+        ax2.legend(loc='upper right')
+        ax2.grid(True, linestyle=':', alpha=0.6)
+        
+        plt.tight_layout()
+        plt.savefig('reports/performance_comparison.png', dpi=150)
+        plt.close()
+        
+        # 2. Update Training Loss History Plot (reports/training_loss.png)
+        if history is not None:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.plot(history['train_loss'], label='Train Total Loss', color='blue', linewidth=1.5)
+            ax.plot(history['val_loss'], label='Val Total Loss', color='orange', linewidth=1.5)
+            ax.plot(history['train_jepa'], label='Train JEPA Loss', color='blue', linestyle='--', alpha=0.7)
+            ax.plot(history['val_jepa'], label='Val JEPA Loss', color='orange', linestyle='--', alpha=0.7)
+            ax.set_xlabel('Epochs', fontsize=11)
+            ax.set_ylabel('Loss', fontsize=11)
+            ax.set_title(f'JEPA World Model Fine-Tuning Loss (Cycle #{cycle})', fontsize=13, fontweight='bold')
+            ax.legend()
+            ax.grid(True, linestyle=':', alpha=0.6)
+            plt.tight_layout()
+            plt.savefig('reports/training_loss.png', dpi=150)
+            plt.close()
+            
+        # 3. Update Virtual Rollout Plot (reports/autotune_rollout.png)
+        if autotuner is not None:
+            v_temps, v_pwms = autotuner.run_virtual_rollout(kp, ki, kd, target_temp, steps=300, initial_temp=initial_temp)
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+            ax1.plot(v_temps, label=f'Optimized Rollout (Kp={kp:.2f}, Ki={ki:.3f}, Kd={kd:.2f})', color='green', linewidth=1.8)
+            ax1.axhline(target_temp, color='blue', linestyle='--', label='Setpoint')
+            ax1.set_ylabel('Temperature (C)', fontsize=11)
+            ax1.set_title(f'JEPA Virtual Simulation Rollout (Cycle #{cycle})', fontsize=13, fontweight='bold')
+            ax1.legend()
+            ax1.grid(True, linestyle=':', alpha=0.6)
+            
+            ax2.plot(v_pwms, label='Optimized PWM', color='green', linewidth=1.5)
+            ax2.set_xlabel('Steps (Seconds)', fontsize=11)
+            ax2.set_ylabel('PWM Duty Cycle', fontsize=11)
+            ax2.legend()
+            ax2.grid(True, linestyle=':', alpha=0.6)
+            
+            plt.tight_layout()
+            plt.savefig('reports/autotune_rollout.png', dpi=150)
+            plt.close()
+            
+        print(f"[Reports Updated] Updated figures saved to reports/ (performance_comparison.png, training_loss.png, autotune_rollout.png)")
+    except Exception as e:
+        print(f"[Warning] Failed to update cycle report plots: {e}")
+
 def run_chamber_loop(hardware, pid, duration, target, excite_dynamics=False):
     """
     Runs the temperature control loop for a given duration with robust safety features.
@@ -581,6 +647,10 @@ def main():
             
             print(f"\n[Gains Updated for Cycle #{cycle+1}] Kp: {best_kp:.4f} -> {new_kp:.4f} | Ki: {best_ki:.4f} -> {new_ki:.4f} | Kd: {best_kd:.4f} -> {new_kd:.4f}\n")
             best_kp, best_ki, best_kd = new_kp, new_ki, new_kd
+            
+            # Regenerate and save updated diagnostic graphs to reports/
+            update_cycle_reports(df_train, history, autotuner, best_kp, best_ki, best_kd, args.target, cycle, initial_temp=args.target - 2.0)
+            
             cycle += 1
         
     except KeyboardInterrupt:
@@ -596,11 +666,11 @@ def main():
             hardware.reset()
             
         if 'best_history' in locals() and len(best_history) > 0:
-            best_record = min(best_history, key=lambda x: x['std'])
+            best_record = min(best_history, key=lambda x: x['rmse'] + 0.5 * x['std'])
             print("\n=====================================================================")
-            print("         OPTIMAL PID GAINS (LEAST TEMPERATURE DEVIATION)            ")
+            print("         OPTIMAL PID GAINS (BEST SETPOINT ACCURACY & STABILITY)      ")
             print("=====================================================================")
-            print(f" Lowest Fluctuation (Cycle #{best_record['cycle']}, StdDev: {best_record['std']:.4f} C, RMSE: {best_record['rmse']:.4f} C):")
+            print(f" Best Performance (Cycle #{best_record['cycle']}, RMSE: {best_record['rmse']:.4f} C, StdDev: {best_record['std']:.4f} C):")
             print(f"   Kp = {best_record['kp']:.4f}")
             print(f"   Ki = {best_record['ki']:.4f}")
             print(f"   Kd = {best_record['kd']:.4f}")

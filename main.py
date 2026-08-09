@@ -81,31 +81,31 @@ def run_chamber_loop(hardware, pid, duration, target, excite_dynamics=False):
             consecutive_read_errors = 0  # reset counter on success
             
         # Check soft safety temperature limit
-        if temp >= soft_temp_limit or safety_active:
-            print(f"[CRITICAL SAFETY] Soft safety limit exceeded (Temp: {temp:.2f}C >= {soft_temp_limit}C) or hardware safety active! Forcing heater OFF!")
-            if isinstance(hardware, ESP32Client):
-                hardware.set_pwm(0)
-            break
+        over_safety = (temp >= soft_temp_limit) or safety_active
+        if over_safety:
+            if step % 10 == 0:
+                print(f"[SAFETY OVERRIDE] Temp ({temp:.2f}C >= {soft_temp_limit}C) or safety flag active! Forcing PWM=0 and continuing loop to monitor cooling...")
+            pwm = 0.0
+        else:
+            # 2. Excite dynamics (toggle target by +/- 0.8C every 45 seconds to capture smooth heating/cooling phases)
+            if excite_dynamics:
+                # Shift setpoint every 45s across 3 phases: target, target + 0.8, target - 0.8
+                phase = (step // 45) % 3
+                if phase == 0:
+                    current_target = target
+                elif phase == 1:
+                    current_target = target + 0.8
+                else:
+                    current_target = target - 0.8
+                pid.set_target(current_target)
+                
+            # 3. Compute control action
+            pwm = pid.compute(temp, dt=1.0)
             
-        # 2. Excite dynamics (toggle target by +/- 1.5C every 30 seconds to capture heating/cooling phases)
-        if excite_dynamics:
-            # Shift setpoint every 30s
-            phase = (step // 30) % 3
-            if phase == 0:
-                current_target = target
-            elif phase == 1:
-                current_target = target + 1.5
-            else:
-                current_target = target - 1.5
-            pid.set_target(current_target)
-            
-        # 3. Compute control action
-        pwm = pid.compute(temp, dt=1.0)
-        
-        # Inject random dither during excitation to explore full state-action space
-        if excite_dynamics:
-            dither = np.random.uniform(-15.0, 15.0)
-            pwm = max(0.0, min(255.0, pwm + dither))
+            # Inject random dither during excitation to explore full state-action space
+            if excite_dynamics:
+                dither = np.random.uniform(-10.0, 10.0)
+                pwm = max(0.0, min(255.0, pwm + dither))
         
         # 4. Write action to hardware
         if isinstance(hardware, ThermalSimulator):
@@ -163,23 +163,25 @@ def main():
     parser.add_argument('--target', type=float, default=35.0,
                         help="Target setpoint temperature to optimize for (default: 35.0)")
     parser.add_argument('--collect-time', type=int, default=180,
-                        help="Duration in seconds for initial training data collection (default: 180)")
-    parser.add_argument('--test-time', type=int, default=180,
-                        help="Duration in seconds for post-tuning validation test (default: 180)")
+                        help="Duration in seconds for initial bootstrap data collection (default: 180)")
+    parser.add_argument('--cycle-interval', type=int, default=300,
+                        help="Duration in seconds per online refinement cycle (default: 300 = 5 min)")
+    parser.add_argument('--conv-thresh', type=float, default=0.06,
+                        help="Temperature StdDev threshold (deg C) to declare parameter convergence (default: 0.06)")
     parser.add_argument('--epochs', type=int, default=20,
-                        help="Number of epochs to train JEPA model (default: 20)")
+                        help="Number of epochs for initial model training (default: 20)")
     parser.add_argument('--batch-size', type=int, default=32,
                         help="Batch size for model training (default: 32)")
     parser.add_argument('--lr', type=float, default=1e-3,
                         help="Learning rate for model training (default: 1e-3)")
-    parser.add_argument('--window', type=int, default=10,
-                        help="History window size L (default: 10)")
-    parser.add_argument('--kp-init', type=float, default=20.0,
-                        help="Initial PID Kp value for data collection (default: 20.0)")
-    parser.add_argument('--ki-init', type=float, default=0.3,
-                        help="Initial PID Ki value for data collection (default: 0.3)")
-    parser.add_argument('--kd-init', type=float, default=5.0,
-                        help="Initial PID Kd value for data collection (default: 5.0)")
+    parser.add_argument('--window', type=int, default=15,
+                        help="History window size L in seconds (default: 15)")
+    parser.add_argument('--kp-init', type=float, default=6.0,
+                        help="Initial PID Kp value for data collection (default: 6.0)")
+    parser.add_argument('--ki-init', type=float, default=0.05,
+                        help="Initial PID Ki value for data collection (default: 0.05)")
+    parser.add_argument('--kd-init', type=float, default=2.0,
+                        help="Initial PID Kd value for data collection (default: 2.0)")
     
     args = parser.parse_args()
     ensure_dirs()
@@ -228,9 +230,9 @@ def main():
     
     try:
         # =====================================================================
-        # PRE-HEAT PHASE
+        # PRE-HEAT PHASE & THERMAL SETTLING
         # =====================================================================
-        preheat_threshold = args.target - 1.0
+        preheat_threshold = args.target - 2.5
         if t_init < preheat_threshold:
             print("---------------------------------------------------------------------")
             print(f" PRE-HEAT PHASE: Warming chamber to {preheat_threshold:.1f}C before tuning...")
@@ -241,23 +243,46 @@ def main():
                 temp, safety_active = hardware.read_temp()
                 if temp is None or safety_active or temp >= preheat_threshold:
                     if temp is not None and temp >= preheat_threshold:
-                        print(f"Pre-heat completed! Current temperature: {temp:.2f}C.")
+                        print(f"Pre-heat target reached! Current temperature: {temp:.2f}C.")
                     break
                 
-                pwm = 255.0  # Apply maximum heat to reach target region rapidly (Bang-Bang Control)
+                pwm = 255.0  # Apply maximum heat to reach preheat threshold rapidly (Bang-Bang Control)
                 if isinstance(hardware, ThermalSimulator):
                     hardware.step(pwm)
                 else:
                     hardware.set_pwm(pwm)
                     
                 if step % 10 == 0:
-                    print(f"  Preheating | Temp: {temp:.2f}C | Setpoint: {preheat_threshold:.1f}C | PWM: {int(pwm)}")
+                    print(f"  Preheating | Temp: {temp:.2f}C | Threshold: {preheat_threshold:.1f}C | PWM: {int(pwm)}")
                 
                 if not isinstance(hardware, ThermalSimulator):
                     time.sleep(1.0)
             
-            print("Allowing temperature to settle for 5 seconds...")
-            time.sleep(5.0)
+            # Settling phase: turn off heater and wait for thermal inertia overshoot to peak and cool down
+            print("\n---------------------------------------------------------------------")
+            print(f" PRE-HEAT SETTLING: Waiting up to 90s for thermal inertia to settle below {args.target - 0.5:.1f}C...")
+            print("---------------------------------------------------------------------")
+            if isinstance(hardware, ESP32Client):
+                hardware.set_pwm(0)
+                
+            settle_target = args.target - 0.5
+            max_settle_steps = 90
+            for step in range(max_settle_steps):
+                temp, safety_active = hardware.read_temp()
+                if temp is None or safety_active:
+                    print("[Warning] Sensor error or safety active during settling!")
+                    break
+                
+                # Check if temperature has peaked and cooled down below settle_target
+                if step >= 15 and temp <= settle_target:
+                    print(f"Chamber settled cleanly at {temp:.2f}C! Ready for Data Collection.\n")
+                    break
+                    
+                if step % 10 == 0:
+                    print(f"  Settling | PWM: 0 | Current Temp: {temp:.2f}C | Target: < {settle_target:.1f}C")
+                    
+                if not isinstance(hardware, ThermalSimulator):
+                    time.sleep(1.0)
 
         # =====================================================================
         # PHASE 1: Data Collection
@@ -277,8 +302,13 @@ def main():
         else:
             hardware.set_pwm(0)
             
-        if len(df_train) < args.window + 2:
-            print("[CRITICAL] Collected dataset is too small. Exiting.")
+        min_required_records = int(args.collect_time * 0.75)
+        if len(df_train) < min_required_records:
+            print(f"\n[CRITICAL ERROR] Phase 1 Data Collection was interrupted early by safety trip or connection error!")
+            print(f"Collected only {len(df_train)}/{args.collect_time} records (minimum required: {min_required_records}).")
+            print("Pipeline aborted to prevent training on incomplete/corrupted data.\n")
+            if args.mode == 'real':
+                hardware.set_pwm(0)
             return
             
         df_train.to_csv(data_path, index=False)
@@ -398,122 +428,119 @@ def main():
         print("Virtual simulation rollout comparison saved to: reports/autotune_rollout.png\n")
         
         # =====================================================================
-        # PHASE 4: Deploy and Validate on Physical System / Simulator
+        # PHASE 4: Online Continuous Adaptive Autotuning Loop
         # =====================================================================
         print("---------------------------------------------------------------------")
-        print(" PHASE 4: Deploying and Testing Tuned PID on Hardware...")
-        print("---------------------------------------------------------------------")
+        print(" PHASE 4: Launching Online Continuous Adaptive Autotuning Loop...")
+        print(" System will continuously regulate temperature while fine-tuning the")
+        print(f" JEPA World Model on live data and updating PID gains every {args.cycle_interval // 60} min.")
+        print(" Press Ctrl+C at any time to stop and save the final parameters.")
+        print("---------------------------------------------------------------------\n")
         
-        # First cool/reset system state for validation run
-        if args.mode == 'sim':
-            # Reset simulator to match initial collection start temperature
-            hardware.reset(t_init)
-        else:
-            print("Please wait 10 seconds for the chamber to stabilize...")
-            hardware.set_pwm(0)
-            time.sleep(10.0)
+        cycle = 1
+        low_var_consecutive = 0
+        
+        while True:
+            print("=====================================================================")
+            print(f" ONLINE AUTOTUNING CYCLE #{cycle}")
+            print(f" Active Gains: Kp={best_kp:.4f}, Ki={best_ki:.4f}, Kd={best_kd:.4f}")
+            print(f" Interval Duration: {args.cycle_interval}s ({args.cycle_interval // 60} minutes)")
+            print("=====================================================================")
             
-        tuned_pid = PIDController(kp=best_kp, ki=best_ki, kd=best_kd, target=args.target)
-        
-        # Run step response test (flat target, no setpoint toggles) to see true steady-state tracking
-        df_test = run_chamber_loop(hardware, tuned_pid, args.test_time, args.target, excite_dynamics=False)
-        
-        # Turn off heater cleanly
-        if args.mode == 'sim':
-            hardware.reset()
-        else:
-            hardware.set_pwm(0)
+            # 1. Instantiate PID with current optimal gains
+            active_pid = PIDController(kp=best_kp, ki=best_ki, kd=best_kd, target=args.target)
             
-        # Also let's extract step-response from initial data collection (or re-run initial if desired)
-        # To keep it simple, we compare the initial collection phase (which had toggles) vs. test phase,
-        # but to make it a fair step comparison, we can extract the first step-response of the initial data collection.
-        # Initial run warmed up from t_init to target. We can extract that.
-        
-        # Save physical performance comparison plot
-        plt.figure(figsize=(10, 6))
-        
-        # Plot initial collection temperatures
-        plt.plot(df_train['temperature'], label=f'Initial Profile (Kp={args.kp_init:.1f}, Ki={args.ki_init:.2f}, Kd={args.kd_init:.2f})', color='orange', alpha=0.7)
-        # Plot physical test temperatures
-        plt.plot(df_test['temperature'], label=f'Tuned PID (Kp={best_kp:.2f}, Ki={best_ki:.3f}, Kd={best_kd:.2f})', color='green', linewidth=2)
-        
-        plt.axhline(args.target, color='blue', linestyle='--', label='Setpoint')
-        plt.title('Chamber Physical Performance: Initial vs. Tuned PID')
-        plt.xlabel('Time (Seconds)')
-        plt.ylabel('Temperature (C)')
-        plt.grid(True)
-        plt.legend()
-        plt.savefig('reports/performance_comparison.png')
-        plt.close()
-        
-        print("\n=====================================================================")
-        print("                        TUNING REPORT SUMMARY                        ")
-        print("=====================================================================")
-        print(f"Optimal Parameters Found:")
-        print(f"  Kp = {best_kp:.4f}")
-        print(f"  Ki = {best_ki:.4f}")
-        print(f"  Kd = {best_kd:.4f}")
-        print("---------------------------------------------------------------------")
-        
-        # Calculate comparison metrics:
-        # We look at tracking performance in the second half of the validation runs (settled phase)
-        settled_start_step = min(int(args.test_time * 0.4), len(df_test) - 2)
-        
-        # Tuned Test settled phase
-        test_settled = df_test['temperature'].iloc[settled_start_step:]
-        test_err = test_settled - args.target
-        rmse_test = np.sqrt(np.mean(test_err**2))
-        std_test = np.std(test_settled)
-        max_overshoot_test = max(0.0, np.max(df_test['temperature']) - args.target)
-        actuator_fluc_test = np.mean(np.abs(np.diff(df_test['pwm'].values)))
-        
-        # Initial settled phase (we extract from df_train where setpoint was first at args.target)
-        # Specifically, step 0 to step 30 was a flat setpoint at args.target
-        init_warmup = df_train[df_train['step'] < 30]
-        init_settled = init_warmup['temperature'].iloc[15:] if len(init_warmup) > 15 else init_warmup['temperature']
-        init_err = init_settled - args.target
-        rmse_init = np.sqrt(np.mean(init_err**2))
-        std_init = np.std(init_settled)
-        max_overshoot_init = max(0.0, np.max(init_warmup['temperature']) - args.target)
-        actuator_fluc_init = np.mean(np.abs(np.diff(init_warmup['pwm'].values)))
-        
-        print(f"Performance Metrics (Settled Phase):")
-        print(f"  Initial Control (Default PID):")
-        print(f"    RMSE to target:           {rmse_init:.4f} C")
-        print(f"    Steady-state Fluctuation: {std_init:.4f} C (StdDev)")
-        print(f"    Max Overshoot:            {max_overshoot_init:.4f} C")
-        print(f"    PWM Actuator Jitter:      {actuator_fluc_init:.2f} units/sec")
-        print(f"  Tuned Control (JEPA Autotuned PID):")
-        print(f"    RMSE to target:           {rmse_test:.4f} C")
-        print(f"    Steady-state Fluctuation: {std_test:.4f} C (StdDev)")
-        print(f"    Max Overshoot:            {max_overshoot_test:.4f} C")
-        print(f"    PWM Actuator Jitter:      {actuator_fluc_test:.2f} units/sec")
-        print("---------------------------------------------------------------------")
-        
-        # Calculate percentage improvements
-        rmse_imp = (rmse_init - rmse_test) / rmse_init * 100 if rmse_init > 0 else 0
-        std_imp = (std_init - std_test) / std_init * 100 if std_init > 0 else 0
-        act_imp = (actuator_fluc_init - actuator_fluc_test) / actuator_fluc_init * 100 if actuator_fluc_init > 0 else 0
-        
-        print(f"Improvements:")
-        print(f"  RMSE Reduction:        {rmse_imp:.1f}%")
-        print(f"  Fluctuation Reduction: {std_imp:.1f}%")
-        print(f"  Actuator Wear Saving:  {act_imp:.1f}%")
-        print("=====================================================================")
-        print("Performance plots saved to: reports/performance_comparison.png")
-        print("You can copy these parameters into your Arduino sketch for standalone mode!")
-        print("=====================================================================")
-        
-        # =====================================================================
-        # PHASE 5: Live Indefinite Control Mode
-        # =====================================================================
-        print("\n---------------------------------------------------------------------")
-        print(" PHASE 5: Entering Indefinite Control Loop with Tuned PID...")
-        print(f" Regulating temperature to target: {args.target}C")
-        print(" Press Ctrl+C to stop and turn off the heater.")
-        print("---------------------------------------------------------------------")
-        
-        run_chamber_loop(hardware, tuned_pid, 99999999, args.target, excite_dynamics=False)
+            # 2. Run active regulation loop for cycle_interval seconds
+            df_cycle = run_chamber_loop(hardware, active_pid, args.cycle_interval, args.target, excite_dynamics=False)
+            
+            if df_cycle.empty or len(df_cycle) < 10:
+                print("[Warning] Cycle data collection interrupted or empty. Retrying cycle...")
+                continue
+                
+            # Append new cycle data to global accumulated dataset
+            df_train = pd.concat([df_train, df_cycle], ignore_index=True)
+            df_train.to_csv(data_path, index=False)
+            
+            # 3. Calculate cycle performance metrics over settled step window (last 100 steps)
+            recent_temps = df_cycle['temperature'].iloc[-min(100, len(df_cycle)):]
+            recent_err = recent_temps - args.target
+            cycle_rmse = np.sqrt(np.mean(recent_err**2))
+            cycle_std = np.std(recent_temps)
+            
+            print(f"\n[Cycle #{cycle} Performance Summary]")
+            print(f"  Settled Fluctuation (StdDev): {cycle_std:.4f} C")
+            print(f"  RMSE to target ({args.target}C):      {cycle_rmse:.4f} C")
+            print(f"  Active Gains Used:           Kp={best_kp:.4f}, Ki={best_ki:.4f}, Kd={best_kd:.4f}")
+            
+            # 4. Check for Parameter Convergence
+            if cycle_std <= args.conv_thresh and cycle_rmse <= args.conv_thresh * 3.0:
+                low_var_consecutive += 1
+                print(f"  [CONVERGENCE CHECK] Low temperature fluctuation detected ({low_var_consecutive}/2 consecutive cycles)!")
+            else:
+                low_var_consecutive = 0
+                
+            if low_var_consecutive >= 2:
+                print("\n*********************************************************************")
+                print(f" 🎉 CONVERGENCE ACHIEVED AT CYCLE #{cycle}!")
+                print(f" Temperature fluctuation is under target threshold ({cycle_std:.4f} C <= {args.conv_thresh:.2f} C).")
+                print(f" FINAL OPTIMAL PID GAINS FOUND:")
+                print(f"    Kp = {best_kp:.4f}")
+                print(f"    Ki = {best_ki:.4f}")
+                print(f"    Kd = {best_kd:.4f}")
+                print(" Copy these parameters into your Arduino sketch for standalone mode!")
+                print("*********************************************************************\n")
+                
+                # Keep running standalone regulation with final parameters
+                print("Entering continuous standalone regulation mode with final optimal parameters...")
+                final_pid = PIDController(kp=best_kp, ki=best_ki, kd=best_kd, target=args.target)
+                run_chamber_loop(hardware, final_pid, 99999999, args.target, excite_dynamics=False)
+                break
+                
+            # 5. Online Fine-Tuning of JEPA World Model on accumulated dataset
+            print(f"\n---------------------------------------------------------------------")
+            print(f" [ONLINE TRAINING] Fine-tuning JEPA World Model on {len(df_train)} total samples...")
+            print("---------------------------------------------------------------------")
+            
+            contexts, actions, targets, target_temps, stats = prepare_data(data_path, window_length=args.window)
+            num_samples = len(contexts)
+            split_idx = int(num_samples * 0.8)
+            indices = np.random.permutation(num_samples)
+            
+            train_dataset = TimeSeriesDataset(
+                contexts[indices[:split_idx]], actions[indices[:split_idx]], 
+                targets[indices[:split_idx]], target_temps[indices[:split_idx]]
+            )
+            val_dataset = TimeSeriesDataset(
+                contexts[indices[split_idx:]], actions[indices[split_idx:]], 
+                targets[indices[split_idx:]], target_temps[indices[split_idx:]]
+            )
+            
+            model.temp_mean = stats['temp_mean']
+            model.temp_std = stats['temp_std']
+            history = trainer.train(train_dataset, val_dataset, epochs=10, batch_size=args.batch_size, device=device)
+            
+            # Save updated weights
+            torch.save({
+                'state_dict': model.state_dict(),
+                'stats': stats,
+                'window_length': args.window
+            }, model_path)
+            
+            # 6. Online Autotuning on updated World Model
+            print(f"---------------------------------------------------------------------")
+            print(f" [ONLINE AUTOTUNING] Searching for refined PID parameters...")
+            print("---------------------------------------------------------------------")
+            autotuner = PIDAutotuner(model, stats, window_length=args.window)
+            new_kp, new_ki, new_kd = autotuner.tune(
+                target_temp=args.target, 
+                initial_temp=args.target - 2.0, 
+                steps=300, 
+                x0=[best_kp, best_ki, best_kd]
+            )
+            
+            print(f"\n[Gains Updated for Cycle #{cycle+1}] Kp: {best_kp:.4f} -> {new_kp:.4f} | Ki: {best_ki:.4f} -> {new_ki:.4f} | Kd: {best_kd:.4f} -> {new_kd:.4f}\n")
+            best_kp, best_ki, best_kd = new_kp, new_ki, new_kd
+            cycle += 1
         
     except KeyboardInterrupt:
         print("\n[CRITICAL] Execution interrupted by user! Safety override: forcing heater OFF.")

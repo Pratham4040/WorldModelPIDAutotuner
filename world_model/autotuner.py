@@ -80,16 +80,17 @@ class PIDAutotuner:
         return temps[:-1], pwms
 
     def evaluate_cost(self, kp, ki, kd, target_temp, steps=120, initial_temp=25.0, 
-                      w_tracking=1.0, w_overshoot=10.0, w_actuator=0.01):
+                      w_tracking=2.0, w_overshoot=4.0, w_undershoot=10.0, w_actuator=0.005):
         """
         Calculates performance cost for a set of PID parameters.
         Penalizes:
           - tracking deviation from setpoint
           - overshoot beyond target
+          - undershoot / droop below target
           - violent changes in PWM control signal
         """
         # Bounds constraints penalty
-        if kp < 0.01 or kp > 50.0 or ki < 0.0 or ki > 5.0 or kd < 0.0 or kd > 20.0:
+        if kp < 3.0 or kp > 35.0 or ki < 0.03 or ki > 1.5 or kd < 0.2 or kd > 6.0:
             return 1e6 # high penalty
             
         temps, pwms = self.run_virtual_rollout(kp, ki, kd, target_temp, steps, initial_temp)
@@ -107,18 +108,24 @@ class PIDAutotuner:
         overshoot = max(0.0, max_temp - target_temp)
         cost_overshoot = overshoot ** 2
         
-        # 3. Actuator effort cost (penalize rapid changes in PWM)
+        # 3. Undershoot / Thermal Droop cost (penalize staying below setpoint in settled window)
+        final_window = temps[-min(40, len(temps)):]
+        undershoot = np.maximum(0.0, target_temp - final_window)
+        cost_undershoot = np.mean(undershoot ** 2)
+        
+        # 4. Actuator effort cost (penalize rapid changes in PWM)
         pwm_diffs = np.diff(pwms)
         cost_actuator = np.mean(pwm_diffs ** 2)
         
         total_cost = (
             w_tracking * cost_tracking + 
             w_overshoot * cost_overshoot + 
+            w_undershoot * cost_undershoot + 
             w_actuator * cost_actuator
         )
         return total_cost
 
-    def tune(self, target_temp, initial_temp=25.0, steps=120, x0=[2.0, 0.05, 1.0]):
+    def tune(self, target_temp, initial_temp=25.0, steps=120, x0=[15.0, 0.15, 2.5]):
         """
         Runs the Nelder-Mead optimizer to find Kp, Ki, Kd using a smooth sigmoid mapping.
         x0: Initial guess [Kp, Ki, Kd]
@@ -133,13 +140,17 @@ class PIDAutotuner:
             p = np.clip(p, 1e-5, 1.0 - 1e-5)
             return np.log(p / (1.0 - p))
             
-        # Define mapping bounds
-        min_kp, max_kp = 0.1, 40.0
-        min_ki, max_ki = 0.001, 3.0
-        min_kd, max_kd = 0.0, 15.0
+        # Define realistic physical mapping bounds (prevents heater starvation & over-damping)
+        min_kp, max_kp = 5.0, 35.0
+        min_ki, max_ki = 0.05, 1.2
+        min_kd, max_kd = 0.5, 6.0
         
         # Convert initial guess to logit space
         kp_init, ki_init, kd_init = x0
+        kp_init = np.clip(kp_init, min_kp, max_kp)
+        ki_init = np.clip(ki_init, min_ki, max_ki)
+        kd_init = np.clip(kd_init, min_kd, max_kd)
+        
         kp_p = (kp_init - min_kp) / (max_kp - min_kp)
         ki_p = (ki_init - min_ki) / (max_ki - min_ki)
         kd_p = (kd_init - min_kd) / (max_kd - min_kd)

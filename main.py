@@ -466,6 +466,7 @@ def main():
         print(" Press Ctrl+C at any time to stop and save the final parameters.")
         print("---------------------------------------------------------------------\n")
         
+        best_history = []
         cycle = 1
         low_var_consecutive = 0
         
@@ -496,6 +497,16 @@ def main():
             cycle_rmse = np.sqrt(np.mean(recent_err**2))
             cycle_std = np.std(recent_temps)
             
+            # Track history of parameters and performance
+            best_history.append({
+                'cycle': cycle,
+                'kp': best_kp,
+                'ki': best_ki,
+                'kd': best_kd,
+                'std': cycle_std,
+                'rmse': cycle_rmse
+            })
+            
             print(f"\n[Cycle #{cycle} Performance Summary]")
             print(f"  Settled Fluctuation (StdDev): {cycle_std:.4f} C")
             print(f"  RMSE to target ({args.target}C):      {cycle_rmse:.4f} C")
@@ -509,19 +520,20 @@ def main():
                 low_var_consecutive = 0
                 
             if low_var_consecutive >= 2:
+                best_record = min(best_history, key=lambda x: x['std'])
                 print("\n*********************************************************************")
                 print(f" 🎉 CONVERGENCE ACHIEVED AT CYCLE #{cycle}!")
                 print(f" Temperature fluctuation is under target threshold ({cycle_std:.4f} C <= {args.conv_thresh:.2f} C).")
-                print(f" FINAL OPTIMAL PID GAINS FOUND:")
-                print(f"    Kp = {best_kp:.4f}")
-                print(f"    Ki = {best_ki:.4f}")
-                print(f"    Kd = {best_kd:.4f}")
+                print(f" OPTIMAL PID GAINS WITH LEAST FLUCTUATION (Cycle #{best_record['cycle']}, StdDev: {best_record['std']:.4f}C):")
+                print(f"    Kp = {best_record['kp']:.4f}")
+                print(f"    Ki = {best_record['ki']:.4f}")
+                print(f"    Kd = {best_record['kd']:.4f}")
                 print(" Copy these parameters into your Arduino sketch for standalone mode!")
                 print("*********************************************************************\n")
                 
                 # Keep running standalone regulation with final parameters
                 print("Entering continuous standalone regulation mode with final optimal parameters...")
-                final_pid = PIDController(kp=best_kp, ki=best_ki, kd=best_kd, target=args.target)
+                final_pid = PIDController(kp=best_record['kp'], ki=best_record['ki'], kd=best_record['kd'], target=args.target)
                 run_chamber_loop(hardware, final_pid, 99999999, args.target, excite_dynamics=False)
                 break
                 
@@ -582,6 +594,27 @@ def main():
                 print(f"Failed to send safety command: {e}")
         else:
             hardware.reset()
+            
+        if 'best_history' in locals() and len(best_history) > 0:
+            best_record = min(best_history, key=lambda x: x['std'])
+            print("\n=====================================================================")
+            print("         OPTIMAL PID GAINS (LEAST TEMPERATURE DEVIATION)            ")
+            print("=====================================================================")
+            print(f" Lowest Fluctuation (Cycle #{best_record['cycle']}, StdDev: {best_record['std']:.4f} C, RMSE: {best_record['rmse']:.4f} C):")
+            print(f"   Kp = {best_record['kp']:.4f}")
+            print(f"   Ki = {best_record['ki']:.4f}")
+            print(f"   Kd = {best_record['kd']:.4f}")
+            print("---------------------------------------------------------------------")
+            print(" Copy these parameters into your Arduino sketch for standalone mode!")
+            print("=====================================================================\n")
+        elif 'best_kp' in locals():
+            print("\n=====================================================================")
+            print("                      LATEST PID PARAMETERS                         ")
+            print("=====================================================================")
+            print(f"   Kp = {best_kp:.4f}")
+            print(f"   Ki = {best_ki:.4f}")
+            print(f"   Kd = {best_kd:.4f}")
+            print("=====================================================================\n")
             
 if __name__ == '__main__':
     main()

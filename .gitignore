@@ -32,4 +32,5 @@ env/
 
 # OS files
 .DS_Store
-Thumbs.db
+# Learning material directory
+learning/

@@ -3,6 +3,17 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Agent skills & customizations
+.agents/
+
+# Presentation builds
+presentations/
+
 # Data directory (log files and collected datasets)
 data/*.csv
 data/*.xlsx
@@ -18,7 +29,7 @@ reports/*.png
 reports/*.jpg
 reports/*.pdf
 
-# Environments
+# Virtual Environments
 .venv/
 venv/
 ENV/
@@ -32,5 +43,6 @@ env/
 
 # OS files
 .DS_Store
+
 # Learning material directory
 learning/
